@@ -1,11 +1,10 @@
-# Large generated data & model files
+# Large generated data & feature files
 data/
-outputs/
+outputs/features/
 
 # Python
 __pycache__/
 *.py[cod]
-*.pth
 *.npy
 
 # Jupyter checkpoints
