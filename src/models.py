@@ -18,6 +18,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from typing import Tuple, Dict, Optional
@@ -126,6 +127,52 @@ class BlockageLocaliser(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Focal Loss
+# ---------------------------------------------------------------------------
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for binary classification (Lin et al., RetinaNet 2017).
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Down-weights easy examples so training focuses on hard, misclassified ones.
+    Particularly effective when class imbalance makes most samples trivially correct.
+
+    Parameters
+    ----------
+    alpha : float
+        Weighting factor for the positive (blocked/abnormal) class.
+        Complement (1-alpha) applies to the negative class.
+    gamma : float
+        Focusing parameter. gamma=0 recovers standard cross-entropy.
+        gamma=2.0 is the value used in the original paper.
+    weight : Tensor, optional
+        Additional per-class weights (same as CrossEntropyLoss weight).
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
+                 weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Cross-entropy per sample (unreduced)
+        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction='none')
+        # p_t = probability of the true class
+        pt = torch.exp(-ce)
+        # alpha_t: alpha for positive class, (1-alpha) for negative class
+        alpha_t = torch.where(
+            targets == 1,
+            torch.full_like(ce, self.alpha),
+            torch.full_like(ce, 1.0 - self.alpha),
+        )
+        return (alpha_t * (1.0 - pt) ** self.gamma * ce).mean()
+
+
+# ---------------------------------------------------------------------------
 # Training utilities
 # ---------------------------------------------------------------------------
 
@@ -166,14 +213,14 @@ def train_detector(
     _, _, F, T = spectrograms.shape
     model = BlockageDetector(freq_bins=F, time_bins=T).to(device)
 
-    # Class-weighted loss to handle imbalanced datasets.
+    # Class-weighted Focal Loss to handle imbalanced datasets.
     # If not provided, compute inverse-frequency weights from training labels.
     if class_weights is None:
         counts = np.bincount(labels, minlength=2).astype(np.float32)
         weights = torch.tensor(counts.sum() / (2.0 * counts + 1e-8), dtype=torch.float32).to(device)
     else:
         weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=weights)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -224,8 +271,10 @@ def train_detector(
 
 
 def train_localiser(
-    signals: np.ndarray,        # shape (N, signal_len)
-    positions: np.ndarray,      # shape (N,)  — primary blockage normalised pos
+    signals: np.ndarray,                        # shape (N, signal_len)
+    positions: np.ndarray,                      # shape (N,) — primary blockage normalised pos
+    physics_positions: Optional[np.ndarray] = None,  # shape (N,) — DSP-derived pos; -1 where unavailable
+    physics_lambda: float = 0.1,
     epochs: int = 30,
     batch_size: int = 64,
     lr: float = 1e-3,
@@ -234,19 +283,45 @@ def train_localiser(
     device: Optional[str] = None,
 ) -> Tuple[BlockageLocaliser, Dict]:
     """
-    Train the BlockageLocaliser on signals that contain exactly one blockage.
+    Train the BlockageLocaliser on signals containing at least one blockage.
+
+    Physics consistency loss
+    ------------------------
+    When `physics_positions` is provided, the training loss includes a term that
+    penalises the CNN prediction for being inconsistent with what peak-detection
+    DSP estimates from the same signal:
+
+        L = L_mse + lambda * L_physics
+
+    where L_physics = mean(|pred - pos_dsp|) over samples where DSP succeeded
+    (physics_positions[i] >= 0). This grounds the CNN in the signal's echo
+    timing rather than pattern-matching alone.
+
+    Parameters
+    ----------
+    physics_positions : array, shape (N,)
+        DSP-derived normalised position per sample. Set to -1 where peak
+        detection found no echo (DSP failure or clear-pipe signal).
+    physics_lambda : float
+        Weight of the physics consistency term (default 0.1).
 
     Returns
     -------
     model   : trained BlockageLocaliser
-    history : dict with keys 'train_loss', 'val_loss', 'val_mae'
+    history : dict with keys 'train_loss', 'val_loss', 'val_mae', 'val_physics_mae'
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    X = torch.tensor(signals[:, np.newaxis, :], dtype=torch.float32)  # (N,1,L)
-    y = torch.tensor(positions[:, np.newaxis],  dtype=torch.float32)  # (N,1)
+    X  = torch.tensor(signals[:, np.newaxis, :], dtype=torch.float32)   # (N,1,L)
+    y  = torch.tensor(positions[:, np.newaxis],  dtype=torch.float32)   # (N,1)
 
-    dataset = TensorDataset(X, y)
+    has_physics = physics_positions is not None
+    if has_physics:
+        yp = torch.tensor(physics_positions[:, np.newaxis], dtype=torch.float32)  # (N,1)
+        dataset = TensorDataset(X, y, yp)
+    else:
+        dataset = TensorDataset(X, y)
+
     n_val   = int(len(dataset) * val_split)
     n_train = len(dataset) - n_val
     train_ds, val_ds = random_split(dataset, [n_train, n_val],
@@ -260,16 +335,41 @@ def train_localiser(
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    history: Dict = {"train_loss": [], "val_loss": [], "val_mae": []}
+    n_physics_train = 0
+    if has_physics:
+        # Count training samples where DSP succeeded
+        train_idx = list(train_ds.indices)
+        n_physics_train = int((physics_positions[train_idx] >= 0).sum())
+        print(f"Physics consistency loss: lambda={physics_lambda}  "
+              f"DSP-valid training samples={n_physics_train}/{n_train}")
+
+    history: Dict = {"train_loss": [], "val_loss": [], "val_mae": [], "val_physics_mae": []}
 
     for epoch in range(1, epochs + 1):
         # --- Train ---
         model.train()
         train_loss = 0.0
-        for xb, yb in train_loader:
+        for batch in train_loader:
+            if has_physics:
+                xb, yb, yp_b = batch
+                yp_b = yp_b.to(device)
+            else:
+                xb, yb = batch
             xb, yb = xb.to(device), yb.to(device)
+
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            preds = model(xb)
+
+            loss = criterion(preds, yb)
+
+            if has_physics:
+                # Physics consistency: penalise only where DSP succeeded (yp >= 0)
+                valid = (yp_b >= 0).squeeze(1)
+                if valid.any():
+                    loss = loss + physics_lambda * torch.abs(
+                        preds[valid] - yp_b[valid]
+                    ).mean()
+
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * len(xb)
@@ -277,26 +377,39 @@ def train_localiser(
 
         # --- Validate ---
         model.eval()
-        val_loss, mae = 0.0, 0.0
+        val_loss, mae, physics_mae, physics_n = 0.0, 0.0, 0.0, 0
         with torch.no_grad():
-            for xb, yb in val_loader:
+            for batch in val_loader:
+                if has_physics:
+                    xb, yb, yp_b = batch
+                    yp_b = yp_b.to(device)
+                else:
+                    xb, yb = batch
                 xb, yb = xb.to(device), yb.to(device)
                 preds    = model(xb)
                 val_loss += criterion(preds, yb).item() * len(xb)
                 mae      += torch.abs(preds - yb).sum().item()
+                if has_physics:
+                    valid = (yp_b >= 0).squeeze(1)
+                    if valid.any():
+                        physics_mae += torch.abs(preds[valid] - yp_b[valid]).sum().item()
+                        physics_n   += valid.sum().item()
         val_loss /= n_val
         mae       /= n_val
+        p_mae = physics_mae / physics_n if physics_n > 0 else float('nan')
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_mae"].append(mae)
+        history["val_physics_mae"].append(p_mae)
         scheduler.step()
 
         if epoch % 5 == 0 or epoch == 1:
+            phys_str = f"  physics_MAE={p_mae:.4f}" if has_physics else ""
             print(f"Epoch {epoch:3d}/{epochs}  "
                   f"train_loss={train_loss:.5f}  "
                   f"val_loss={val_loss:.5f}  "
-                  f"val_MAE={mae:.4f}")
+                  f"val_MAE={mae:.4f}{phys_str}")
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)

@@ -65,7 +65,7 @@ def step_generate(args) -> tuple:
     sim = AcousticPipeSimulator(fs=44_100, pulse_freq=2_000, pulse_duration=0.003)
     t0 = time.time()
 
-    signals, labels, positions = sim.generate_dataset(
+    signals, labels, positions, pipe_lengths = sim.generate_dataset(
         n_samples=args.n_samples,
         pipe_length_range=(10.0, 50.0),
         max_blockages=3,
@@ -74,15 +74,19 @@ def step_generate(args) -> tuple:
         seed=args.seed,
     )
 
-    np.save('data/signals.npy',   signals)
-    np.save('data/labels.npy',    labels)
-    np.save('data/positions.npy', positions)
+    np.save('data/signals.npy',         signals)
+    np.save('data/labels.npy',          labels)
+    np.save('data/positions.npy',       positions)
+    np.save('data/pipe_lengths.npy',    pipe_lengths)
+    # Notebooks use ../data/ (one level up), keep in sync
+    os.makedirs('../data', exist_ok=True)
+    np.save('../data/pipe_lengths.npy', pipe_lengths)
 
     elapsed = time.time() - t0
     print(f'Generated {args.n_samples} samples in {elapsed:.1f}s')
     print(f'  signals  : {signals.shape}')
     print(f'  labels   : clear={( labels==0).sum()}  blocked={(labels==1).sum()}')
-    return signals, labels, positions
+    return signals, labels, positions, pipe_lengths
 
 
 # ---------------------------------------------------------------------------
@@ -132,20 +136,42 @@ def step_train_detector(specs: np.ndarray, labels: np.ndarray, args) -> dict:
 # Step 4: Train localiser
 # ---------------------------------------------------------------------------
 
-def step_train_localiser(sigs_norm: np.ndarray, positions: np.ndarray, labels: np.ndarray, args) -> dict:
+def step_train_localiser(
+    sigs_norm: np.ndarray,
+    signals_raw: np.ndarray,
+    positions: np.ndarray,
+    pipe_lengths: np.ndarray,
+    labels: np.ndarray,
+    args,
+) -> dict:
     section('STEP 4 — Training Blockage Localiser (1-D CNN)')
+    FS, V = 44_100, 343.0
 
-    # Use all blocked samples, not just single-blockage ones.
-    # Target = position of the first (nearest) blockage, which is positions[:, 0]
-    # for all samples with at least one blockage.
-    mask = labels == 1
+    mask     = labels == 1
     sigs_blk = sigs_norm[mask]
-    pos_blk  = positions[mask, 0]   # first blockage position (sorted nearest-first)
+    pos_blk  = positions[mask, 0]
+    plen_blk = pipe_lengths[mask]
+    raw_blk  = signals_raw[mask]
 
+    # Pre-compute DSP (peak-detection) position estimates for physics consistency loss.
+    # For each blocked signal, detect the first echo peak and convert to normalised position.
+    # physics_positions[i] = -1 where peak detection fails.
     print(f'Blocked samples used for localiser: {mask.sum()}')
+    print('Pre-computing DSP physics positions...')
+    physics_pos = np.full(mask.sum(), -1.0, dtype=np.float32)
+    for i, (sig, pipe_len) in enumerate(zip(raw_blk, plen_blk)):
+        peak_t, _ = detect_echo_peaks(sig, fs=FS, min_prominence=0.03)
+        if len(peak_t) > 0:
+            pos_m = peak_t[0] * V / 2.0
+            physics_pos[i] = float(np.clip(pos_m / pipe_len, 0.0, 1.0))
+    n_valid = (physics_pos >= 0).sum()
+    print(f'  DSP succeeded on {n_valid}/{mask.sum()} samples ({n_valid/mask.sum()*100:.1f}%)')
+
     model, history = train_localiser(
         signals=sigs_blk,
         positions=pos_blk,
+        physics_positions=physics_pos,
+        physics_lambda=0.1,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
@@ -194,12 +220,14 @@ def main():
     print('\nAcoustic Pipe Inspection Pipeline')
     print(f'  n_samples={args.n_samples}  epochs={args.epochs}  seed={args.seed}')
 
-    signals, labels, positions = step_generate(args)
-    specs, sigs_norm           = step_features(signals)
+    signals, labels, positions, pipe_lengths = step_generate(args)
+    specs, sigs_norm                        = step_features(signals)
 
     if not args.skip_train:
-        det_history   = step_train_detector(specs, labels, args)
-        loc_history   = step_train_localiser(sigs_norm, positions, labels, args)
+        det_history = step_train_detector(specs, labels, args)
+        loc_history = step_train_localiser(
+            sigs_norm, signals, positions, pipe_lengths, labels, args
+        )
 
     step_dsp_baseline(signals, labels)
 
@@ -208,6 +236,7 @@ def main():
     print('  data/signals.npy              — raw waveforms')
     print('  data/labels.npy               — binary labels')
     print('  data/positions.npy            — blockage positions')
+    print('  data/pipe_lengths.npy         — per-sample pipe lengths (m)')
     print('  outputs/features/spectrograms.npy')
     print('  outputs/features/signals_norm.npy')
     if not args.skip_train:

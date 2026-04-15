@@ -229,7 +229,7 @@ class AcousticPipeSimulator:
         snr_range: Tuple[float, float] = (10.0, 30.0),
         fixed_duration: float = 0.35,
         seed: Optional[int] = 42,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Generate a labelled dataset of synthetic pipe signals.
 
@@ -242,14 +242,19 @@ class AcousticPipeSimulator:
         positions : ndarray, shape (n_samples, max_blockages)
             Normalised blockage positions in [0, 1].
             Padded with -1.0 where no blockage exists.
+        pipe_lengths : ndarray, shape (n_samples,)
+            Actual pipe length in metres for each sample. Required to convert
+            normalised positions back to metres and to compute physics-derived
+            echo times for the physics consistency loss.
         """
         if seed is not None:
             np.random.seed(seed)
 
         N = int(self.fs * fixed_duration)
-        signals   = np.zeros((n_samples, N), dtype=np.float32)
-        labels    = np.zeros(n_samples,      dtype=np.int64)
-        positions = np.full((n_samples, max_blockages), -1.0, dtype=np.float32)
+        signals     = np.zeros((n_samples, N), dtype=np.float32)
+        labels      = np.zeros(n_samples,      dtype=np.int64)
+        positions   = np.full((n_samples, max_blockages), -1.0, dtype=np.float32)
+        pipe_lengths = np.zeros(n_samples, dtype=np.float32)
 
         for i in range(n_samples):
             pipe_len = float(np.random.uniform(*pipe_length_range))
@@ -281,10 +286,11 @@ class AcousticPipeSimulator:
                 signals[i, :actual_len] = sig
 
             labels[i] = 1 if n_blk > 0 else 0
+            pipe_lengths[i] = pipe_len
             for j, b in enumerate(blockages[:max_blockages]):
-                positions[i, j] = b.position / pipe_len   # normalised 0–1
+                positions[i, j] = b.position / pipe_len   # normalised 0-1
 
-        return signals, labels, positions
+        return signals, labels, positions, pipe_lengths
 
 
 # ---------------------------------------------------------------------------
