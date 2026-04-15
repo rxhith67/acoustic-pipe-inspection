@@ -93,15 +93,65 @@ class AcousticPipeSimulator:
     # Single signal simulation
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pink noise generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pink_noise(N: int) -> np.ndarray:
+        """
+        Generate pink (1/f) noise via spectral shaping of white noise.
+        Power spectral density scales as 1/f, matching the background noise
+        profile of real pipe environments (machinery vibration, flow noise).
+        """
+        white = np.fft.rfft(np.random.randn(N))
+        freqs = np.fft.rfftfreq(N)
+        freqs[0] = 1.0                              # avoid divide-by-zero at DC
+        pink_filter = 1.0 / np.sqrt(freqs)
+        pink_filter[0] = 0.0                        # zero DC component
+        pink = np.fft.irfft(white * pink_filter, n=N)
+        return (pink / (pink.std() + 1e-12)).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Internal helper: add one echo at a given delay
+    # ------------------------------------------------------------------
+
+    def _add_echo(
+        self,
+        buffer: np.ndarray,
+        pulse: np.ndarray,
+        delay_s: float,
+        amplitude: float,
+    ) -> None:
+        """Add a scaled, delayed copy of pulse into buffer in-place."""
+        N, P = len(buffer), len(pulse)
+        i = int(delay_s * self.fs)
+        if i >= N:
+            return
+        end = min(i + P, N)
+        buffer[i:end] += (pulse[:end - i] * amplitude).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Single signal simulation
+    # ------------------------------------------------------------------
+
     def simulate(
         self,
         pipe: PipeConfig,
         blockages: List[Blockage],
         snr_db: float = 20.0,
         signal_duration: Optional[float] = None,
+        noise_color: str = 'pink',
+        multipath: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray, List[float]]:
         """
         Simulate one transmission event.
+
+        Parameters
+        ----------
+        noise_color : 'pink' (1/f, default) or 'white' (flat spectrum).
+        multipath   : if True, add secondary reflections (echo-of-echo bouncing
+                      between blockages and pipe ends).
 
         Returns
         -------
@@ -110,54 +160,58 @@ class AcousticPipeSimulator:
         received : ndarray, shape (N,)
             Simulated received waveform (transmitted pulse + echoes + noise).
         echo_times : list of float
-            Ground-truth echo arrival times for each blockage (seconds).
+            Ground-truth first-order echo arrival times for each blockage (seconds).
         """
-        # Duration must be long enough to capture the farthest echo
         max_travel = 2.0 * pipe.length / pipe.speed_of_sound
         if signal_duration is None:
-            signal_duration = max_travel + 0.05   # 50 ms margin
+            signal_duration = max_travel + 0.05
 
         N = int(self.fs * signal_duration)
         received = np.zeros(N, dtype=np.float32)
         pulse = self._pulse
         P = len(pulse)
 
-        # --- Transmitted pulse at t = 0 (direct signal) ---
+        # --- Transmitted pulse at t = 0 ---
         received[:P] += pulse.astype(np.float32)
 
         echo_times: List[float] = []
 
-        # --- Blockage echoes ---
+        # --- First-order blockage echoes ---
         for b in blockages:
             if not (0 < b.position < pipe.length):
-                continue                            # ignore out-of-range blockages
+                continue
 
-            t_echo  = 2.0 * b.position / pipe.speed_of_sound
-            i_echo  = int(t_echo * self.fs)
-            # Linear amplitude attenuation with distance
-            atten   = 10 ** (-pipe.attenuation_db_m * b.position / 20.0)
-            amp     = b.severity * atten
+            t1 = 2.0 * b.position / pipe.speed_of_sound
+            a1 = b.severity * 10 ** (-pipe.attenuation_db_m * b.position / 20.0)
+            self._add_echo(received, pulse, t1, a1)
+            echo_times.append(t1)
 
-            end_idx = i_echo + P
-            if end_idx <= N:
-                received[i_echo:end_idx] += (pulse * amp).astype(np.float32)
-            else:
-                clip = N - i_echo
-                received[i_echo:N] += (pulse[:clip] * amp).astype(np.float32)
+            if multipath:
+                # Second-order: blockage echo reflects off the transmitter end
+                # and travels back to the blockage and returns.
+                # Total path = 4 * b.position
+                t2 = 4.0 * b.position / pipe.speed_of_sound
+                a2 = a1 * b.severity * 10 ** (-pipe.attenuation_db_m * b.position / 20.0)
+                self._add_echo(received, pulse, t2, a2 * 0.3)
 
-            echo_times.append(t_echo)
+                # Second-order: echo bounces off pipe end, back to blockage
+                t3 = (2.0 * pipe.length + 2.0 * (pipe.length - b.position)) / pipe.speed_of_sound
+                a3 = 0.05 * 10 ** (-pipe.attenuation_db_m * pipe.length / 20.0)
+                self._add_echo(received, pulse, t3, a3 * b.severity * 0.2)
 
         # --- Pipe-end reflection (weak, always present) ---
-        t_end  = 2.0 * pipe.length / pipe.speed_of_sound
-        i_end  = int(t_end * self.fs)
-        atten_end = 10 ** (-pipe.attenuation_db_m * pipe.length / 20.0)
-        if i_end + P <= N:
-            received[i_end:i_end + P] += (pulse * 0.05 * atten_end).astype(np.float32)
+        t_end = 2.0 * pipe.length / pipe.speed_of_sound
+        a_end = 0.05 * 10 ** (-pipe.attenuation_db_m * pipe.length / 20.0)
+        self._add_echo(received, pulse, t_end, a_end)
 
-        # --- Additive white Gaussian noise ---
+        # --- Noise ---
         sig_power   = float(np.mean(received ** 2)) + 1e-12
         noise_power = sig_power / (10 ** (snr_db / 10.0))
-        noise = np.random.normal(0.0, np.sqrt(noise_power), N).astype(np.float32)
+        std = float(np.sqrt(noise_power))
+        if noise_color == 'pink':
+            noise = self._pink_noise(N) * std
+        else:
+            noise = np.random.normal(0.0, std, N).astype(np.float32)
         received += noise
 
         t_axis = np.linspace(0.0, signal_duration, N, dtype=np.float32)

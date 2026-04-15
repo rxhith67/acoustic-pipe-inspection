@@ -33,8 +33,8 @@ def parse_args():
     p.add_argument('--epochs',     type=int,   default=30,    help='Training epochs')
     p.add_argument('--batch_size', type=int,   default=64)
     p.add_argument('--lr',         type=float, default=1e-3)
-    p.add_argument('--snr_min',    type=float, default=10.0)
-    p.add_argument('--snr_max',    type=float, default=30.0)
+    p.add_argument('--snr_min',    type=float, default=5.0)
+    p.add_argument('--snr_max',    type=float, default=25.0)
     p.add_argument('--seed',       type=int,   default=42)
     p.add_argument('--skip_train', action='store_true',
                    help='Skip training, only generate data and features')
@@ -132,19 +132,20 @@ def step_train_detector(specs: np.ndarray, labels: np.ndarray, args) -> dict:
 # Step 4: Train localiser
 # ---------------------------------------------------------------------------
 
-def step_train_localiser(sigs_norm: np.ndarray, positions: np.ndarray, args) -> dict:
+def step_train_localiser(sigs_norm: np.ndarray, positions: np.ndarray, labels: np.ndarray, args) -> dict:
     section('STEP 4 — Training Blockage Localiser (1-D CNN)')
 
-    # Single-blockage subset only
-    n_blockages = (positions > -0.5).sum(axis=1)
-    mask = n_blockages == 1
-    sigs_1blk = sigs_norm[mask]
-    pos_1blk  = positions[mask, 0]
+    # Use all blocked samples, not just single-blockage ones.
+    # Target = position of the first (nearest) blockage, which is positions[:, 0]
+    # for all samples with at least one blockage.
+    mask = labels == 1
+    sigs_blk = sigs_norm[mask]
+    pos_blk  = positions[mask, 0]   # first blockage position (sorted nearest-first)
 
-    print(f'Single-blockage samples: {mask.sum()}')
+    print(f'Blocked samples used for localiser: {mask.sum()}')
     model, history = train_localiser(
-        signals=sigs_1blk,
-        positions=pos_1blk,
+        signals=sigs_blk,
+        positions=pos_blk,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
@@ -198,7 +199,7 @@ def main():
 
     if not args.skip_train:
         det_history   = step_train_detector(specs, labels, args)
-        loc_history   = step_train_localiser(sigs_norm, positions, args)
+        loc_history   = step_train_localiser(sigs_norm, positions, labels, args)
 
     step_dsp_baseline(signals, labels)
 

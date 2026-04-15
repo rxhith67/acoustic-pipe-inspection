@@ -138,6 +138,7 @@ def train_detector(
     val_split: float = 0.2,
     save_path: Optional[str] = None,
     device: Optional[str] = None,
+    class_weights: Optional[np.ndarray] = None,
 ) -> Tuple[BlockageDetector, Dict]:
     """
     Train the BlockageDetector on labelled spectrograms.
@@ -165,7 +166,14 @@ def train_detector(
     _, _, F, T = spectrograms.shape
     model = BlockageDetector(freq_bins=F, time_bins=T).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    # Class-weighted loss to handle imbalanced datasets.
+    # If not provided, compute inverse-frequency weights from training labels.
+    if class_weights is None:
+        counts = np.bincount(labels, minlength=2).astype(np.float32)
+        weights = torch.tensor(counts.sum() / (2.0 * counts + 1e-8), dtype=torch.float32).to(device)
+    else:
+        weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
