@@ -1,0 +1,16 @@
+# Large generated data & model files
+data/
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pth
+*.npy
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Env
+.env
+venv/
