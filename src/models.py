@@ -159,10 +159,14 @@ class FocalLoss(nn.Module):
         self.weight = weight
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Cross-entropy per sample (unreduced)
+        # Weighted cross-entropy per sample (loss magnitude includes class weight)
         ce = F.cross_entropy(logits, targets, weight=self.weight, reduction='none')
-        # p_t = probability of the true class
-        pt = torch.exp(-ce)
+        # p_t from raw logits — decoupled from class weights so focal modulation
+        # measures genuine classification difficulty, not weight-inflated difficulty.
+        log_pt = F.log_softmax(logits, dim=1).gather(
+            1, targets.unsqueeze(1)
+        ).squeeze(1)
+        pt = torch.exp(log_pt)
         # alpha_t: alpha for positive class, (1-alpha) for negative class
         alpha_t = torch.where(
             targets == 1,
@@ -186,6 +190,7 @@ def train_detector(
     save_path: Optional[str] = None,
     device: Optional[str] = None,
     class_weights: Optional[np.ndarray] = None,
+    focal_alpha: float = 0.25,
 ) -> Tuple[BlockageDetector, Dict]:
     """
     Train the BlockageDetector on labelled spectrograms.
@@ -220,7 +225,7 @@ def train_detector(
         weights = torch.tensor(counts.sum() / (2.0 * counts + 1e-8), dtype=torch.float32).to(device)
     else:
         weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-    criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=weights)
+    criterion = FocalLoss(alpha=focal_alpha, gamma=2.0, weight=weights)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 

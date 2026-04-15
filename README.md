@@ -34,29 +34,40 @@ Acoustic pulse  →  Echo recording  →  STFT spectrogram  →  2D CNN (detect)
 | Task | Method | Result |
 |------|--------|--------|
 | Blockage detection | 2D CNN + Focal Loss | AUC **1.000**, accuracy **100%** |
-| Blockage localisation | 1D CNN + physics loss (λ=0.1) | MAE **1.59 m** on 30 m pipe |
+| Blockage localisation | 1D CNN + physics loss (λ=0.1) | MAE **1.28 m** on 30 m pipe |
 | DSP baseline (detection) | Peak detection | F1 0.860 |
-| DSP baseline (localisation) | Echo timing | MAE 3.89 m |
-| CNN vs DSP (localisation) | | **59% improvement** |
+| DSP baseline (localisation) | Matched filter echo timing | MAE 3.89 m |
+| CNN vs DSP (localisation) | | **67% improvement** |
 
 ### Real-data validation (MIMII pump dataset)
 
 | Metric | Value |
 |--------|-------|
-| AUC | **0.836** |
-| Abnormal recall | **63%** |
-| Normal recall | 92% |
-| Accuracy | 89.1% |
+| AUC | **0.854** |
+| Abnormal recall | **81%** |
+| Normal recall | 66% |
+| Accuracy | 67.8% |
+
+8-channel microphone averaging + Focal Loss (alpha=0.891) targeting the minority abnormal class.
 
 ### SNR robustness (localiser)
 
-| SNR | DSP MAE | CNN MAE |
-|-----|---------|---------|
-| 5 dB | 14.7 m | 6.6 m |
-| 15 dB | 9.0 m | 4.2 m |
-| 25 dB | 0.06 m | 2.9 m |
+| SNR | DSP MAE (matched filter) | CNN MAE |
+|-----|--------------------------|---------|
+| 5 dB | 12.85 m | 12.09 m |
+| 15 dB | 8.58 m | 7.62 m |
+| 25 dB | 0.08 m | 2.74 m |
 
-CNN significantly outperforms DSP below 15 dB — the realistic operating regime for buried pipes with soil attenuation.
+CNN outperforms matched-filter DSP below 20 dB — the realistic operating regime for buried pipes with soil attenuation.
+
+### Unsupervised anomaly detection (autoencoder, no labels)
+
+| Method | AUC |
+|--------|-----|
+| Convolutional autoencoder (reconstruction error) | 0.525 |
+| Supervised CNN (Focal Loss, all channels) | **0.854** |
+
+The autoencoder is trained on normal signals only and uses reconstruction error as an anomaly score. The near-random AUC (0.525) confirms that pump anomalies in MIMII are spectrally subtle and require labelled supervision to detect reliably. The supervised CNN gap (0.329 AUC points) quantifies the value of labelled data for this task.
 
 ---
 
@@ -66,17 +77,20 @@ CNN significantly outperforms DSP below 15 dB — the realistic operating regime
 acoustic_pipe_inspection/
 ├── src/
 │   ├── simulation.py          # physics-based signal generation (pink noise, multipath)
-│   ├── features.py            # STFT spectrograms, envelope features, DSP peak detection
+│   ├── features.py            # STFT spectrograms, envelope features, matched filtering
 │   └── models.py              # BlockageDetector, BlockageLocaliser, FocalLoss, training loops
 ├── outputs/
 │   └── models/
-│       ├── detector.pth       # trained 2D CNN detector (synthetic)
-│       └── localiser.pth      # trained 1D CNN localiser
+│       ├── detector.pth           # trained 2D CNN detector (synthetic)
+│       ├── localiser.pth          # trained 1D CNN localiser
+│       ├── detector_mimii.pth     # 2D CNN fine-tuned on MIMII pump data
+│       └── autoencoder_mimii.pth  # convolutional autoencoder (normal-only training)
 ├── 01_simulation.ipynb        # physics walkthrough, signal generation
-├── 02_signal_analysis.ipynb   # DSP baseline, spectrograms, peak detection
+├── 02_signal_analysis.ipynb   # DSP baseline, matched filtering vs envelope detection
 ├── 03_detection.ipynb         # 2D CNN detector: training, confusion matrix, ROC
 ├── 04_localisation.ipynb      # 1D CNN localiser, physics consistency loss, SNR ablation
-├── 05_mimii_realdata.ipynb    # real-data validation on MIMII industrial pump dataset
+├── 05_mimii_realdata.ipynb    # supervised real-data validation (MIMII pump dataset)
+├── 06_autoencoder.ipynb       # unsupervised autoencoder anomaly detection (no labels)
 ├── run_pipeline.py            # end-to-end training script
 ├── predict.py                 # single-signal inference (detect + localise)
 └── requirements.txt

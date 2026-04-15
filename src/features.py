@@ -14,7 +14,7 @@ presence and position.
 """
 
 import numpy as np
-from scipy.signal import stft, find_peaks
+from scipy.signal import stft, find_peaks, correlate
 from typing import Tuple, Optional
 
 
@@ -153,6 +153,29 @@ def extract_envelope_features(
 
 
 # ---------------------------------------------------------------------------
+# Pulse template
+# ---------------------------------------------------------------------------
+
+def make_pulse(
+    fs: int = 44_100,
+    pulse_freq: float = 2_000.0,
+    pulse_duration: float = 0.003,
+) -> np.ndarray:
+    """
+    Generate the Gaussian-modulated sine pulse used by the simulator.
+    Returned as float32 array, normalised to unit peak amplitude.
+    Used as the matched-filter template.
+    """
+    n = int(fs * pulse_duration)
+    t = np.linspace(0.0, pulse_duration, n)
+    centre = pulse_duration / 2.0
+    sigma  = pulse_duration / 6.0
+    envelope = np.exp(-0.5 * ((t - centre) / sigma) ** 2)
+    pulse = envelope * np.sin(2.0 * np.pi * pulse_freq * t)
+    return (pulse / (np.abs(pulse).max() + 1e-12)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Echo peak detection (classical DSP baseline)
 # ---------------------------------------------------------------------------
 
@@ -196,6 +219,79 @@ def detect_echo_peaks(
     # Convert envelope indices back to time
     peak_times = peaks * hop / fs
     peak_ampls = env[peaks]
+    return peak_times, peak_ampls
+
+
+# ---------------------------------------------------------------------------
+# Matched filter (theoretically optimal echo detector)
+# ---------------------------------------------------------------------------
+
+def matched_filter_echo_peaks(
+    signal: np.ndarray,
+    pulse_template: np.ndarray,
+    fs: int = 44_100,
+    pulse_duration: float = 0.003,
+    min_prominence: float = 0.1,
+    min_separation_sec: float = 0.002,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Detect echo arrivals using matched filtering.
+
+    Cross-correlates the received signal with the known transmitted pulse
+    template. This is the theoretically optimal linear detector for a known
+    signal in additive white Gaussian noise — it maximises SNR at the echo
+    arrival time.
+
+    Compared to envelope peak detection, matched filtering:
+    - Is more sensitive at low SNR (coherent integration gain)
+    - Gives sharper, better-localised peaks (resolution ~ 1/bandwidth)
+    - Suppresses off-pulse noise more effectively
+
+    Parameters
+    ----------
+    signal : 1-D float array, the received waveform.
+    pulse_template : 1-D float array, the transmitted pulse shape (from make_pulse()).
+    fs : sampling frequency in Hz.
+    pulse_duration : duration of the pulse in seconds (used to set the
+        ignore window around the direct transmission).
+    min_prominence : minimum peak prominence as a fraction of the global max
+        of the matched-filter output.
+    min_separation_sec : minimum time between detected echoes (seconds).
+
+    Returns
+    -------
+    peak_times : echo arrival times in seconds
+    peak_ampls : matched-filter output amplitude at each peak
+    """
+    P = len(pulse_template)
+
+    # Cross-correlate: output[k] = sum_i signal[i] * template[i - k]
+    # scipy.signal.correlate with mode='full' returns length N+P-1.
+    # Slicing [P-1:] aligns the output so index k = lag k samples.
+    mf = correlate(signal.astype(np.float64),
+                   pulse_template.astype(np.float64),
+                   mode='full')[P - 1:]
+    mf = np.abs(mf).astype(np.float32)
+
+    # Blank out the direct pulse window (first pulse_duration seconds)
+    ignore = int(pulse_duration * fs) + P
+    search = mf.copy()
+    search[:ignore] = 0.0
+
+    if search.max() < 1e-12:
+        return np.array([]), np.array([])
+
+    search_norm = search / search.max()
+
+    min_dist = max(1, int(min_separation_sec * fs))
+    peaks, _ = find_peaks(
+        search_norm,
+        prominence=min_prominence,
+        distance=min_dist,
+    )
+
+    peak_times = peaks / fs
+    peak_ampls = mf[peaks]
     return peak_times, peak_ampls
 
 
